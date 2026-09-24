@@ -1,0 +1,10 @@
+<resources>
+    <color name="wa_green_dark">#075E54</color>
+    <color name="wa_green">#128C7E</color>
+    <color name="wa_green_light">#25D366</color>
+    <color name="wa_chat_bg">#ECE5DD</color>
+    <color name="wa_bubble_sent">#DCF8C6</color>
+    <color name="wa_bubble_received">#FFFFFF</color>
+    <color name="wa_text_dark">#1A1A1A</color>
+    <color name="wa_text_grey">#667781</color>
+</resources>
