@@ -22,6 +22,18 @@ import com.google.android.gms.nearby.Nearby
 import com.google.android.gms.nearby.connection.*
 import java.io.File
 import java.io.FileOutputStream
+import android.media.AudioFormat
+import android.media.AudioManager
+import android.media.AudioRecord
+import android.media.AudioTrack
+import android.media.MediaRecorder
+import android.view.MotionEvent
+import java.io.PipedInputStream
+import java.io.PipedOutputStream
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 
 class MainActivity : AppCompatActivity() {
 
@@ -49,6 +61,9 @@ class MainActivity : AppCompatActivity() {
     private var connectedDeviceName: String = ""
     // payloadId -> the FILE payload, kept until its transfer completes
     private val incomingFilePayloads = mutableMapOf<Long, Payload>()
+    private val SAMPLE_RATE = 16000
+    private var audioRecord: AudioRecord? = null
+    private var isTalking = false
 
     private val pickImageLauncher = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         uri?.let { sendImage(it) }
@@ -60,7 +75,9 @@ class MainActivity : AppCompatActivity() {
         Manifest.permission.BLUETOOTH_SCAN,
         Manifest.permission.ACCESS_FINE_LOCATION,
         Manifest.permission.ACCESS_WIFI_STATE,
-        Manifest.permission.CHANGE_WIFI_STATE
+        Manifest.permission.CHANGE_WIFI_STATE,
+        Manifest.permission.RECORD_AUDIO,
+        Manifest.permission.POST_NOTIFICATIONS
     )
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -87,6 +104,24 @@ class MainActivity : AppCompatActivity() {
         findViewById<TextView>(R.id.btnAttach).setOnClickListener { pickImageLauncher.launch("image/*") }
 
         requestPermissions()
+        createNotificationChannel()
+
+        val callButton = findViewById<TextView>(R.id.btnCall)
+        callButton.setOnTouchListener { v, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    startTalking()
+                    v.setBackgroundColor(Color.parseColor("#0B7A6E"))
+                    true
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    stopTalking()
+                    v.setBackgroundColor(Color.TRANSPARENT)
+                    true
+                }
+                else -> false
+            }
+        }
 
         if (myName.isBlank()) {
             showNameDialog(firstTime = true)
@@ -240,9 +275,14 @@ class MainActivity : AppCompatActivity() {
                 Payload.Type.BYTES -> {
                     val message = String(payload.asBytes()!!)
                     addBubble(message, isMine = false)
+                    showMessageNotification(connectedDeviceName, message)
                 }
                 Payload.Type.FILE -> {
                     incomingFilePayloads[payload.id] = payload
+                }
+                Payload.Type.STREAM -> {
+                    val inputStream = payload.asStream()?.asInputStream()
+                    if (inputStream != null) playIncomingAudio(inputStream)
                 }
                 else -> {}
             }
@@ -356,6 +396,94 @@ class MainActivity : AppCompatActivity() {
         row.addView(imageView)
         chatContainer.addView(row)
         chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
+    }
+
+    private fun startTalking() {
+        val endpointId = connectedEndpointId ?: return
+        if (isTalking) return
+        isTalking = true
+
+        val minBufSize = AudioRecord.getMinBufferSize(
+            SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+        )
+        try {
+            audioRecord = AudioRecord(
+                MediaRecorder.AudioSource.MIC, SAMPLE_RATE,
+                AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, minBufSize
+            )
+        } catch (e: SecurityException) {
+            isTalking = false
+            return
+        }
+
+        val pipedInputStream = PipedInputStream()
+        val pipedOutputStream = PipedOutputStream(pipedInputStream)
+        connectionsClient.sendPayload(endpointId, Payload.fromStream(pipedInputStream))
+
+        audioRecord?.startRecording()
+        Thread {
+            val buffer = ByteArray(minBufSize)
+            while (isTalking) {
+                val read = audioRecord?.read(buffer, 0, buffer.size) ?: -1
+                if (read > 0) {
+                    try { pipedOutputStream.write(buffer, 0, read) } catch (e: Exception) { break }
+                }
+            }
+            try { pipedOutputStream.close() } catch (e: Exception) {}
+        }.start()
+    }
+
+    private fun stopTalking() {
+        isTalking = false
+        audioRecord?.stop()
+        audioRecord?.release()
+        audioRecord = null
+    }
+
+    private fun playIncomingAudio(inputStream: java.io.InputStream) {
+        Thread {
+            val minBufSize = AudioTrack.getMinBufferSize(
+                SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
+            )
+            val audioTrack = AudioTrack(
+                AudioManager.STREAM_MUSIC, SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO,
+                AudioFormat.ENCODING_PCM_16BIT, minBufSize, AudioTrack.MODE_STREAM
+            )
+            audioTrack.play()
+            val buffer = ByteArray(minBufSize)
+            try {
+                var read: Int
+                while (inputStream.read(buffer).also { read = it } != -1) {
+                    audioTrack.write(buffer, 0, read)
+                }
+            } catch (e: Exception) {
+            } finally {
+                audioTrack.stop()
+                audioTrack.release()
+            }
+        }.start()
+    }
+
+    private fun createNotificationChannel() {
+        val channel = NotificationChannel(
+            "offline_chat_messages", "Chat Messages", NotificationManager.IMPORTANCE_HIGH
+        )
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(channel)
+    }
+
+    private fun showMessageNotification(senderName: String, message: String) {
+        val builder = NotificationCompat.Builder(this, "offline_chat_messages")
+            .setSmallIcon(android.R.drawable.ic_dialog_email)
+            .setContentTitle(senderName)
+            .setContentText(message)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setAutoCancel(true)
+
+        try {
+            NotificationManagerCompat.from(this).notify(1001, builder.build())
+        } catch (e: SecurityException) {
+        }
     }
 
     override fun onDestroy() {
